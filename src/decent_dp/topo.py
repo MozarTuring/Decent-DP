@@ -137,6 +137,7 @@ class RingTopology(Topology):
     """One-peer ring topology where each node communicates with one of its left and right \
         neighbors (by index) in each iteration. The weights are 0.5 for each neighbor.
     """
+    # note that it's one peer ring!!
 
     def _get_topo_edges(self) -> List[List[Edge]]:
         if self._world_size % 2 != 0:

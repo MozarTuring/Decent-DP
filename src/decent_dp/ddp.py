@@ -143,6 +143,7 @@ class DecentralizedDataParallel(Module):
     def _create_trace_hooks(self):
         """Create hooks to trace the order of used parameters in backward pass
         """
+        # [pid for pid, param in enumerate(self._params)] is the same at different nodes, but this list is in order of parameter registration. The parameter order of doing backward is better, because it's faster. We group parameters who get their gradients fast and then synchronize them among nodes. If we use registration order, then first few parameters may not get gradients first, which is not efficient.
         for pid, param in enumerate(self._params):
             self._trace_hooks.append(
                 param.register_post_accumulate_grad_hook(
@@ -151,7 +152,7 @@ class DecentralizedDataParallel(Module):
                         pid=pid
                     )
                 )
-            )
+            ) # after gradients accumulate and before optimizer.step()
     
     @torch.no_grad()
     def _sync_at_start(self):
@@ -211,15 +212,18 @@ class DecentralizedDataParallel(Module):
             # get the peers to communicate with in this iteration
             edge = self._topo.get_edge(self._step)
             weight = edge.weight
+            # logger.info(f'{weight}') # When fixed i, if w_{ij} are the same value for all j, then weight can be a scaler. 
 
             # optionally call the pre_average_hook for optimizers using the communication information
             if hasattr(self._optims[bucket_id], 'pre_average_hook'):
                 self._optims[bucket_id].pre_average_hook(edge, weight) # type: ignore
 
             # replace the local model with the mixed model
-            if self._param_as_bucket_view:
+            # the following should be the consensus step
+            if self._param_as_bucket_view: # true
                 self._param_blocks[bucket_id].mul_(weight - (1 - weight) / (len(edge.ranks) - 1))
-                self._param_blocks[bucket_id].add_(self._comm_blocks[bucket_id])
+                self._param_blocks[bucket_id].add_(self._comm_blocks[bucket_id]) # this step change model weights
+                # note that the above mixing steps are triggered after the gradient is calculated, that means gradient is calculated with respect to param before mixing. treat this as the mixing step of first iteration and then do optim.step, then it aligns with the algorithm in paper.
             else:
                 torch._foreach_mul_(self._param_buckets[bucket_id], weight - (1 - weight) / (len(edge.ranks) - 1))
                 torch._foreach_add_(self._param_buckets[bucket_id], self._comm_buffers[bucket_id])
@@ -242,8 +246,8 @@ class DecentralizedDataParallel(Module):
             scheduler = cast(LRScheduler, self._lr_schedulers[bucket_id])
             scheduler.step()
 
-        # launch the next communication after updating the weights
-        if self._param_as_bucket_view:
+        # launch the next communication after updating the weights. Last iteration ends here and next iteration starts here.
+        if self._param_as_bucket_view: # true
             self._comm_blocks[bucket_id].copy_(self._param_blocks[bucket_id])
         else:
             torch._foreach_copy_(self._comm_buffers[bucket_id], self._param_buckets[bucket_id])
@@ -257,7 +261,7 @@ class DecentralizedDataParallel(Module):
             op=dist.ReduceOp.SUM,
             group=edge.group,
             async_op=True
-        )
+        ) # this step doesn't change model weights
 
     @torch.no_grad()
     def _initialize_params(self):
@@ -282,6 +286,8 @@ class DecentralizedDataParallel(Module):
         # split the parameters into roughly equal-size buckets, and register hooks on the last parameter of each bucket
         start = 0
         size = 0
+        print(self._traced_param_ids[:10])
+        logger.info(self._traced_param_ids[:10])
         for i in range(len(self._traced_param_ids)):
             size += self._align(self._params[self._traced_param_ids[i]].numel()) * self._params[self._traced_param_ids[i]].element_size()
             if (size >= self._bucket_size) or (i == len(self._traced_param_ids) - 1):
@@ -295,6 +301,7 @@ class DecentralizedDataParallel(Module):
                     )
                 )
                 self._param_buckets.append([self._params[j] for j in self._traced_param_ids[start:i+1]])
+                # the element of self._param_buckets is a list of which the element is one element from self._params
                 param_names = [self._param_names[j] for j in self._traced_param_ids[start:i+1]]
 
                 # create optimizer and learning rate scheduler for parameters in each bucket
@@ -320,7 +327,7 @@ class DecentralizedDataParallel(Module):
                                      requires_grad=False,
                                      dtype=self._param_buckets[i][0].dtype)
 
-            if self._param_as_bucket_view:
+            if self._param_as_bucket_view: #true
                 # create contiguous blocks for each bucket, and let the parameters be views of the fragments of the block
                 self._param_blocks.append(torch.zeros(total_size,
                                                       device=self._param_buckets[i][0].device,
@@ -401,7 +408,7 @@ class DecentralizedDataParallel(Module):
         """Forward pass of the model
         """
         # lazy initialization at the second iteration
-        if (self._step == 1) and (not self._initialized):
+        if (self._step == 1) and (not self._initialized): # notice this condition!! step==1 not step==0
             self._initialized = True
             # initialize the parameters and communication buffers
             self._initialize_params()
