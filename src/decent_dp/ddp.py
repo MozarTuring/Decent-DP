@@ -263,6 +263,15 @@ class DecentralizedDataParallel(Module):
             async_op=True
         ) # this step doesn't change model weights
 
+        # for consensus error, to be done
+        # g = dist.group.WORLD
+        # N = dist.get_world_size(g)
+
+        # sum_x = self._param_blocks[bucket_id].clone()
+        # dist.all_reduce(sum_x, op=dist.ReduceOp.SUM, group=g)
+        # xbar = sum_x / N
+        # (self._param_blocks[bucket_id]-xbar)**2
+
     @torch.no_grad()
     def _initialize_params(self):
         """Initialize the parameter buckets and communication buffers
@@ -353,6 +362,7 @@ class DecentralizedDataParallel(Module):
                         assert self._param_buckets[i][j].is_contiguous()
                         self._param_blocks[-1].narrow(0, start, size).copy_(self._param_buckets[i][j].view(-1))
                         self._param_buckets[i][j].data = self._param_blocks[-1].narrow(0, start, size).view_as(self._param_buckets[i][j])
+                        # same storage but different view
                     start += self._align(size)
 
             self._comm_blocks.append(comm_block)
