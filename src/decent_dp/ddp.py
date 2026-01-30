@@ -1,7 +1,8 @@
+import time
 import os
 import copy
 import math
-from loguru import logger
+#from loguru import logger
 from functools import partial
 from typing import Callable, Iterator, List, Optional, Tuple, cast
 import torch
@@ -15,7 +16,7 @@ from torch.nn.parameter import Parameter
 from torch.utils.hooks import RemovableHandle
 from torch.optim.lr_scheduler import LRScheduler
 from .topo import TopologyReg, Topology
-
+from .jw_utils import *
 
 """Data type for the optimizer function"""
 OPTIM_FN_TYPE = Callable[[List[Tuple[str, Tensor]]], Optimizer]
@@ -23,6 +24,17 @@ OPTIM_FN_TYPE = Callable[[List[Tuple[str, Tensor]]], Optimizer]
 
 """Data type for the learning rate scheduler function"""
 LR_SCHEDULER_FN_TYPE = Callable[[Optimizer], LRScheduler]
+
+
+def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
+    momentum.lerp_(grad, 1 - beta)
+    update = grad.lerp_(momentum, beta) if nesterov else momentum
+    if update.ndim == 4: # for the case of conv filters
+        update = update.view(len(update), -1)
+    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
+    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+    return update
+
 
 
 class DecentralizedDataParallel(Module):
@@ -64,11 +76,13 @@ class DecentralizedDataParallel(Module):
                  param_as_bucket_view: bool = True,
                  sync_buffer_in_global_avg: bool = False,
                  bucket_size_in_mb: int = 25,
-                 _local_world_size: Optional[int] = None):
+                 _local_world_size: Optional[int] = None,
+                 toy_test=False):
         
         super(DecentralizedDataParallel, self).__init__()
         assert dist.is_available() and dist.is_initialized(), 'Distributed environment is not initialized'
 
+        self._model = model
         self._model = model.cuda() if torch.cuda.is_available() else model
         self._optim_fn = optim_fn
         self._lr_schd_fn = lr_scheduler_fn
@@ -93,12 +107,24 @@ class DecentralizedDataParallel(Module):
             logger.debug(f'Rank: {self._rank}, Local World Size: {self._local_world_size}, World Size: {self._world_size}, Topology: {topology}')
 
         # model parameters
-        self._params: List[Tensor] = list([x for _, x in self._model.named_parameters() if x.requires_grad])
-        self._param_names: List[str] = list([n for n, x in self._model.named_parameters() if x.requires_grad])
+        # self._params: List[Tensor] = list([x for _, x in self._model.named_parameters() if x.requires_grad])
+        # self._param_names: List[str] = list([n for n, x in self._model.named_parameters() if x.requires_grad])
+
+        logger.debug('start')
+        self._params_muon, self._params_adamw, self._params_muon_names, self._params_adamw_names = split_params_by_module_type(model)
+        self._params_muon_objId = [id(ele) for ele in self._params_muon]
+        self._params_adamw_objId = [id(ele) for ele in self._params_adamw]
+        logger.debug(f'{len(self._params_muon)}, {len(self._params_adamw)}')
+        logger.debug('end')
+
+        self._params = self._params_muon+self._params_adamw
+        self._params_names = self._params_muon_names+self._params_adamw_names
 
         # trace hooks and traced parameter ids
         self._trace_hooks: List[RemovableHandle] = []
-        self._traced_param_ids: List[int] = []
+        # self._traced_param_ids: List[int] = []
+        self._traced_param_ids_muon: List[int] = []
+        self._traced_param_ids_adamw: List[int] = []
 
         self._step: int = 0
         self._comm_ops: List[Optional[Work]] = []
@@ -127,6 +153,46 @@ class DecentralizedDataParallel(Module):
 
         # flag for initializing the parameters
         self._initialized: bool = False
+        self.theta = 0.2
+        self.toy_test = toy_test
+        self.inf_grad = False
+
+    def zeropower_via_newtonschulz5(self, G, steps: int):
+        """
+        Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+        quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+        of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+        zero even beyond the point where the iteration no longer converges all the way to one everywhere
+        on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+        where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
+        performance at all relative to UV^T, where USV^T = G is the SVD.
+        """
+        assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
+        a, b, c = (3.4445, -4.7750,  2.0315)
+#        logger.debug(f'{G.dtype}')
+        X = G.bfloat16()
+#        logger.debug(f'{X.dtype, X}')
+        if G.size(-2) > G.size(-1):
+            X = X.mT
+
+#        logger.debug(f'{torch.isnan(X).any(), torch.isinf(X).any()}')
+
+        # Ensure spectral norm is at most 1
+#        logger.debug(f'{X.norm(dim=(-2, -1), keepdim=True)}')
+        X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+#        logger.debug(f'{X}')
+        # Perform the NS iterations
+        for _ in range(steps):
+            A = X @ X.mT
+#            logger.debug(f'{A}')
+            B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+#            logger.debug(f'{B}')
+            X = a * X + B @ X
+#            logger.debug(f'{X}')
+        
+        if G.size(-2) > G.size(-1):
+            X = X.mT
+        return X
 
 
     def _check_channels_last(self) -> bool:
@@ -145,6 +211,9 @@ class DecentralizedDataParallel(Module):
         """
         # [pid for pid, param in enumerate(self._params)] is the same at different nodes, but this list is in order of parameter registration. The parameter order of doing backward is better, because it's faster. We group parameters who get their gradients fast and then synchronize them among nodes. If we use registration order, then first few parameters may not get gradients first, which is not efficient.
         for pid, param in enumerate(self._params):
+#            param.register_post_accumulate_grad_hook(
+#                    self.check_grad_hook)
+
             self._trace_hooks.append(
                 param.register_post_accumulate_grad_hook(
                     partial(
@@ -186,11 +255,20 @@ class DecentralizedDataParallel(Module):
         """
         if self._is_grad_accum_enable:
             return
-        assert not (pid in self._traced_param_ids), 'The parameter is used more than once in the backward pass'
-        self._traced_param_ids.append(pid)
+        assert not (pid in self._traced_param_ids_muon+self._traced_param_ids_adamw), 'The parameter is used more than once in the backward pass'
+#        logger.debug(f'{pid, type(self._params[pid]), self._params[pid].shape, type(self._params_muon)}')
+        if id(self._params[pid]) in self._params_muon_objId:
+            self._traced_param_ids_muon.append(pid)
+        elif id(self._params[pid]) in self._params_adamw_objId:
+            self._traced_param_ids_adamw.append(pid)
+        else:
+            logger.debug('error')
+            1/0
+
 
     @torch.no_grad()
-    def _ddp_fn(self, _: Tensor, bucket_id: int):
+    def _ddp_fn(self, param: Tensor, bucket_id: int):
+        1/0
         """Hook function to perform the bucket-wise update and communication
 
         Args:
@@ -201,7 +279,32 @@ class DecentralizedDataParallel(Module):
         # skip the update and communication if the model is accumulating gradients
         if self._is_grad_accum_enable:
             return
+        if param is self._param_buckets_adamw[bucket_id][-1]:
+            _param_buckets = self._param_buckets_adamw
+        elif param is self._param_buckets_muon[bucket_id][-1]:
+            _param_buckets = self._param_buckets_muon
+            _param_blocks -= msgn(self.V_blocks[bucket_id])
+            _comm_blocks_param.copy_(_param_blocks)
+            _comm_blocks_param.mul_((1 - weight) / (len(edge.ranks) - 1))
+            dist.all_reduce(
+                    _comm_blocks_param,
+                    op=dist.ReduceOp.SUM,
+                    group=edge.group,
+                    async_op=True
+                )
+            _param_blocks.mul_(weight - (1 - weight) / (len(edge.ranks) - 1))
+            _param_blocks.add_(_comm_blocks_param[bucket_id])
         
+        else:
+            logger.debug('error')
+            1/0
+
+
+
+            # TODO: update V
+
+
+
         # perform the bucket-wise update and communication when all gradients in the bucket are accumulated
         comm_op = self._comm_ops[bucket_id]
         if comm_op is not None:
@@ -225,20 +328,22 @@ class DecentralizedDataParallel(Module):
                 self._param_blocks[bucket_id].add_(self._comm_blocks[bucket_id]) # this step change model weights
                 # note that the above mixing steps are triggered after the gradient is calculated, that means gradient is calculated with respect to param before mixing. treat this as the mixing step of first iteration and then do optim.step, then it aligns with the algorithm in paper.
             else:
-                torch._foreach_mul_(self._param_buckets[bucket_id], weight - (1 - weight) / (len(edge.ranks) - 1))
-                torch._foreach_add_(self._param_buckets[bucket_id], self._comm_buffers[bucket_id])
+                torch._foreach_mul_(_param_buckets[bucket_id], weight - (1 - weight) / (len(edge.ranks) - 1))
+                torch._foreach_add_(_param_buckets[bucket_id], self._comm_buffers[bucket_id])
         
         # perform local update
         if self._scaler:
             if self._grad_clip_norm > 0:
                 self._scaler.unscale_(self._optims[bucket_id])
-                torch.nn.utils.clip_grad_norm_(self._param_buckets[bucket_id], self._grad_clip_norm)
+                torch.nn.utils.clip_grad_norm_(_param_buckets[bucket_id], self._grad_clip_norm)
             self._scaler.step(self._optims[bucket_id])
-            if bucket_id == len(self._param_buckets) - 1:
+            if bucket_id == len(_param_buckets) - 1:
+                logger.debug(f'{self._scaler.get_scale()}')
                 self._scaler.update()
+                logger.debug(f'{self._scaler.get_scale()}')
         else:
             if self._grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(self._param_buckets[bucket_id], self._grad_clip_norm)
+                torch.nn.utils.clip_grad_norm_(_param_buckets[bucket_id], self._grad_clip_norm)
             self._optims[bucket_id].step()
         self._optims[bucket_id].zero_grad()
 
@@ -250,7 +355,7 @@ class DecentralizedDataParallel(Module):
         if self._param_as_bucket_view: # true
             self._comm_blocks[bucket_id].copy_(self._param_blocks[bucket_id])
         else:
-            torch._foreach_copy_(self._comm_buffers[bucket_id], self._param_buckets[bucket_id])
+            torch._foreach_copy_(self._comm_buffers[bucket_id], _param_buckets[bucket_id])
 
         edge = self._topo.get_edge(self._step + 1)
         weight = edge.weight
@@ -281,114 +386,41 @@ class DecentralizedDataParallel(Module):
         """
 
         # verify the number of elements and the order of the parameters on different nodes are the same
-        verify = [[(i, self._params[i].numel()) for i in self._traced_param_ids]]
+        verify = [[(i, self._params[i].numel()) for i in self._traced_param_ids_muon]]
         result = [[(0, 0)]] if self._rank != 0 else verify
         dist.broadcast_object_list(result, src=0)
         if not all([x == y for x, y in zip(verify[0], result[0])]):
             raise RuntimeError('Number/Order of elements in used parameters is different on different nodes')
     
-        # remove the trace hooks
+        verify = [[(i, self._params[i].numel()) for i in self._traced_param_ids_adamw]]
+        result = [[(0, 0)]] if self._rank != 0 else verify
+        dist.broadcast_object_list(result, src=0)
+        if not all([x == y for x, y in zip(verify[0], result[0])]):
+            raise RuntimeError('Number/Order of elements in used parameters is different on different nodes')
+
+        # remove the trace hooks because they only need to execute once and already execute once when the first time the gradient is calculated
         for hook in self._trace_hooks:
             hook.remove()
         del self._trace_hooks
 
         # split the parameters into roughly equal-size buckets, and register hooks on the last parameter of each bucket
-        start = 0
-        size = 0
-        print(self._traced_param_ids[:10])
-        logger.info(self._traced_param_ids[:10])
-        for i in range(len(self._traced_param_ids)):
-            size += self._align(self._params[self._traced_param_ids[i]].numel()) * self._params[self._traced_param_ids[i]].element_size()
-            if (size >= self._bucket_size) or (i == len(self._traced_param_ids) - 1):
-                # register hooks on the last parameter of each bucket, passing the bucket id
-                self._ddp_hooks.append(
-                    self._params[self._traced_param_ids[i]].register_post_accumulate_grad_hook(
-                        partial(
-                            lambda data, bucket_id: self._ddp_fn(data, bucket_id),
-                            bucket_id=len(self._ddp_hooks)
-                        )
-                    )
-                )
-                self._param_buckets.append([self._params[j] for j in self._traced_param_ids[start:i+1]])
-                # the element of self._param_buckets is a list of which the element is one element from self._params
-                param_names = [self._param_names[j] for j in self._traced_param_ids[start:i+1]]
+        self._param_buckets_muon, self._grad_buckets_muon = self.create_buckets(self._traced_param_ids_muon, )
 
-                # create optimizer and learning rate scheduler for parameters in each bucket
-                self._optims.append(self._optim_fn(list(zip(param_names, self._param_buckets[-1]))))
-                self._lr_schedulers.append(self._lr_schd_fn(self._optims[-1]) if self._lr_schd_fn is not None else None)
-                size = 0
-                start = i + 1
+        self._param_buckets_adamw, self._grad_buckets_adamw = self.create_buckets(self._traced_param_ids_adamw, )
 
-        size_dict = {}
-
-        for i in range(len(self._param_buckets)):
-            total_size = sum([self._align(p.numel()) for p in self._param_buckets[i]])
-
-            # make sure the total size is unique for each bucket \
-            # (not necessary, but make sure the communication operations are unique for each bucket with negligible overhead)
-            while total_size in size_dict:
-                total_size += 32
-            size_dict[total_size] = True
-
-            # create the communication buffer for each bucket
-            comm_block = torch.zeros(total_size,
-                                     device=self._param_buckets[i][0].device,
-                                     requires_grad=False,
-                                     dtype=self._param_buckets[i][0].dtype)
-
-            if self._param_as_bucket_view: #true
-                # create contiguous blocks for each bucket, and let the parameters be views of the fragments of the block
-                self._param_blocks.append(torch.zeros(total_size,
-                                                      device=self._param_buckets[i][0].device,
-                                                      requires_grad=True,
-                                                      dtype=self._param_buckets[i][0].dtype))
-                start = 0
-                for j in range(len(self._param_buckets[i])):
-                    size = self._param_buckets[i][j].numel()
-                    if (len(self._param_buckets[i][j].shape) == 4) and self._param_buckets[i][j].is_contiguous(memory_format=torch.channels_last) \
-                        and (not self._param_buckets[i][j].is_contiguous()):
-                        # permute the tensor to the channels_last format
-                        self._param_blocks[-1].narrow(0, start, size).copy_(self._param_buckets[i][j].permute(0, 2, 3, 1).view(-1))
-                        self._param_buckets[i][j].data = self._param_blocks[-1].narrow(0, start, size).view(
-                            (self._param_buckets[i][j].shape[0],
-                             self._param_buckets[i][j].shape[2],
-                             self._param_buckets[i][j].shape[3],
-                             self._param_buckets[i][j].shape[1])
-                        ).permute(0, 3, 1, 2)
-                        assert self._param_buckets[i][j].is_contiguous(memory_format=torch.channels_last)
-                        assert not self._param_buckets[i][j].is_contiguous()
-                    else:
-                        # otherwise, copy the tensor directly
-                        assert self._param_buckets[i][j].is_contiguous()
-                        self._param_blocks[-1].narrow(0, start, size).copy_(self._param_buckets[i][j].view(-1))
-                        self._param_buckets[i][j].data = self._param_blocks[-1].narrow(0, start, size).view_as(self._param_buckets[i][j])
-                        # same storage but different view
-                    start += self._align(size)
-
-            self._comm_blocks.append(comm_block)
-            start = 0
-            self._comm_buffers.append([])
-            for j in range(len(self._param_buckets[i])):
-                size = self._param_buckets[i][j].numel()
-                if (len(self._param_buckets[i][j].shape) == 4) and self._param_buckets[i][j].is_contiguous(memory_format=torch.channels_last) \
-                    and (not self._param_buckets[i][j].is_contiguous()):
-                    # permute the tensor to the channels_last format
-                    self._comm_buffers[-1].append(comm_block.narrow(0, start, size).view(
-                        (self._param_buckets[i][j].shape[0],
-                         self._param_buckets[i][j].shape[2],
-                         self._param_buckets[i][j].shape[3],
-                         self._param_buckets[i][j].shape[1])
-                    ).permute(0, 3, 1, 2))
-                else:
-                    self._comm_buffers[-1].append(comm_block.narrow(0, start, size).view_as(self._param_buckets[i][j]))
-                start += self._align(size)
-
-                # attach the communication buffer to the parameter for "pre_average_hook" in the optimizer
-                if hasattr(self._optims[i], 'pre_average_hook'):
-                    setattr(self._param_buckets[i][j], 'comm_buffer', self._comm_buffers[-1][-1])
-            
-            # initialize the communication buffer with the initial parameters
-            torch._foreach_copy_(self._comm_buffers[-1], self._param_buckets[i])
+        self._param_buckets = self._param_buckets_muon+self._param_buckets_adamw
+        self._param_blocks_comm, self._param_blocks = self.create_block(self._param_buckets)
+        self._M_blocks, self._grad_blocks = self.create_block(self._grad_buckets_muon+self._grad_buckets_adamw)
+        if self.toy_test:
+            logger.debug(f'{self._param_buckets_muon, self._grad_buckets_muon, self._param_blocks_comm, self._param_blocks, self._M_blocks, self._grad_blocks}')
+        self._V_blocks, self._V_blocks_old, self._V_blocks_comm, self._comm_op_V, self._comm_op = [list() for _ in range(5)]
+        for ele in self._M_blocks:
+            self._V_blocks.append(ele.clone())
+            self._V_blocks_old.append(ele.clone())
+            self._V_blocks_comm.append(ele.clone())
+            self._comm_op_V.append(None)
+            self._comm_op.append(None)
+        # self._comm_blocks_adamw, self._blocks_adamw = self.create_block(self._param_buckets_adamw)
 
         self._comm_ops = [None] * len(self._param_buckets)
 
@@ -396,6 +428,55 @@ class DecentralizedDataParallel(Module):
         """Align the size to 128-byte boundary
         """
         return math.ceil(size / 32) * 32
+
+#    def check_grad_hook(self, inp):
+#        if torch.isinf(inp.grad).any():
+#            self.inf_grad = True
+
+    def create_buckets(self, inp_traced_param_ids):
+        start = 0
+        size = 0
+        _param_buckets, _grad_buckets = list(), list()
+        for i in range(len(inp_traced_param_ids)):
+            size += self._align(self._params[inp_traced_param_ids[i]].numel()) * self._params[inp_traced_param_ids[i]].element_size()
+            if (size >= self._bucket_size) or (i == len(inp_traced_param_ids) - 1):
+                # register hooks on the last parameter of each bucket, passing the bucket id
+                # self._ddp_hooks.append(
+                #     self._params[inp_traced_param_ids[i]].register_post_accumulate_grad_hook(
+                #         partial(
+                #             lambda data, bucket_id: self._ddp_fn(data, bucket_id),
+                #             bucket_id=len(self._ddp_hooks)
+                #         )
+                #     )
+                # )
+                tmp1, tmp2 = list(), list()
+                for j in inp_traced_param_ids[start:i+1]:
+                    tmp1.append(self._params[j])
+                    X = self._params[j].grad
+                    if torch.isnan(X).any():
+                        logger.debug('error')
+                        1/0
+                    if torch.isinf(X).any():
+                        logger.debug(f'{self._params_names[j]} grad inf')
+                        1/0
+                    tmp2.append(X)
+                _param_buckets.append(tmp1)
+
+                _grad_buckets.append(tmp2)
+                
+                
+                # the element of _param_buckets is a list whose element is one element from self._params
+                # param_names = [self._param_names[j] for j in inp_traced_param_ids[start:i+1]]
+
+                # create optimizer and learning rate scheduler for parameters in each bucket
+#                self._optims.append(self._optim_fn(list(zip(param_names, _param_buckets[-1]))))
+                self._optims.append(self._optim_fn(_param_buckets[-1]))
+                self._lr_schedulers.append(self._lr_schd_fn(self._optims[-1]) if self._lr_schd_fn is not None else None)
+                size = 0
+                start = i + 1
+
+        return _param_buckets, _grad_buckets
+
 
 
     """Delegation functions"""
@@ -418,56 +499,160 @@ class DecentralizedDataParallel(Module):
         """Forward pass of the model
         """
         # lazy initialization at the second iteration
-        if (self._step == 1) and (not self._initialized): # notice this condition!! step==1 not step==0
-            self._initialized = True
-            # initialize the parameters and communication buffers
-            self._initialize_params()
+        if self._step >= 1:
+            if self._step == 1:
+                # initialize the parameters and communication buffers
+                start = time.time()
+                self._initialize_params()
+                logger.debug(f'initialize time cost {time.time() - start}')
 
+            self.eta = self._lr_schedulers[0].get_last_lr()[0]
+            if self._step <=10:
+                logger.debug(f'step: {self._step}, lr: {self.eta}')
             # manually trigger the communications for the first iteration only
             with torch.no_grad():
-                edge = self._topo.get_edge(self._step)
-                weight = edge.weight
+                t = torch.tensor([0], dtype=torch.int32).cuda() # int16 doesn't work
                 for i in range(len(self._param_buckets)):
                     # optionally call the pre_average_hook for optimizers using the communication information
-                    if hasattr(self._optims[i], 'pre_average_hook'):
-                        self._optims[i].pre_average_hook(edge, weight) # type: ignore
+                    # print(hasattr(self._optims[i], 'pre_average_hook'))
+                    # if hasattr(self._optims[i], 'pre_average_hook'):
+                    #     self._optims[i].pre_average_hook(edge, weight) # type: ignore
 
-                    # update parameters and launch the first communication
-                    if self._scaler:
-                        if self._grad_clip_norm > 0:
-                            self._scaler.unscale_(self._optims[i])
-                            torch.nn.utils.clip_grad_norm_(self._param_buckets[i], self._grad_clip_norm)
-                        self._scaler.step(self._optims[i])
-                        if i == len(self._param_buckets) - 1:
-                            self._scaler.update()
-                            # TODO: synchronize the scaler state across all workers?
-                    else:
-                        if self._grad_clip_norm > 0:
-                            torch.nn.utils.clip_grad_norm_(self._param_buckets[i], self._grad_clip_norm)
-                        self._optims[i].step()
-                    self._optims[i].zero_grad()
-                    if self._lr_schedulers[i] is not None:
-                        scheduler = cast(LRScheduler, self._lr_schedulers[i])
-                        scheduler.step()
-                    
-                    # launch the first communication
-                    if self._param_as_bucket_view:
-                        self._comm_blocks[i].copy_(self._param_blocks[i])
-                    else:
-                        torch._foreach_copy_(self._comm_buffers[i], self._param_buckets[i])
-                    
-                    self._comm_blocks[i].mul_((1 - weight) / (len(edge.ranks) - 1))
-                    comm_op = dist.all_reduce(
-                        self._comm_blocks[i],
-                        op=dist.ReduceOp.SUM,
-                        group=edge.group,
-                        async_op=True
-                    )
-                    self._comm_ops[i] = comm_op
-                    # wait for the communication to finish to fully synchronize the workers
-                    assert comm_op is not None
-                    comm_op.wait()
+                    # # update parameters and launch the first communication
+                    self._scaler.step(self._optims[i]) # do unscale internally
 
+                scale1 = self._scaler.get_scale()
+                self._scaler.update()
+                scale2 = self._scaler.get_scale()
+                if scale2 < scale1:
+                    t.fill_(1)
+                    logger.debug(f"scale changed from {scale1} to {scale2}")
+
+                dist.all_reduce(t, op=dist.ReduceOp.MAX)
+                if t.item() == 0:
+                    edge = self._topo.get_edge(self._step)
+                    weight = edge.weight
+
+                    for i in range(len(self._param_buckets)):
+                        # optionally call the pre_average_hook for optimizers using the communication information
+                        # print(hasattr(self._optims[i], 'pre_average_hook'))
+                        # if hasattr(self._optims[i], 'pre_average_hook'):
+                        #     self._optims[i].pre_average_hook(edge, weight) # type: ignore
+
+                        # # update parameters and launch the first communication
+                        if self._scaler:
+                            if self._grad_clip_norm > 0:
+                                self._scaler.unscale_(self._optims[i])
+                                torch.nn.utils.clip_grad_norm_(self._param_buckets[i], self._grad_clip_norm)
+                            self._scaler.step(self._optims[i])
+                            if i == len(self._param_buckets) - 1:
+                                self._scaler.update()
+#                                logger.debug(f"current scale:{self._scaler.get_scale()}")
+                                # TODO: synchronize the scaler state across all workers?
+                        else:
+                            if self._grad_clip_norm > 0:
+                                torch.nn.utils.clip_grad_norm_(self._param_buckets[i], self._grad_clip_norm)
+#                        self._optims[i].step()
+#                    if self._lr_schedulers[i] is not None:
+#                        scheduler = cast(LRScheduler, self._lr_schedulers[i])
+#                        scheduler.step()
+#                    logger.debug(f'{self._M_blocks[i], self._grad_blocks[i]}')
+                        new_M = (1-self.theta) * self._M_blocks[i] + self.theta * self._grad_blocks[i]
+#                    X = self._grad_blocks[i]
+#                    logger.debug(f'{torch.isnan(X).any(), torch.isinf(X).any()}', rank=[0,1])
+#                    X = self._M_blocks[i]
+#                    logger.debug(f'{torch.isnan(X).any(), torch.isinf(X).any()}', rank=[0,1])
+#                    X = new_M
+#                    logger.debug(f'{torch.isnan(X).any(), torch.isinf(X).any()}', rank=[0,1])
+                        if self.toy_test:
+                            logger.debug(f'new_M {new_M}, {new_M[0]}')
+                            tmp = new_M[0].detach().item()
+                            if self._step == 1:
+                                if self._rank == 0:
+                                    assert f'{tmp:.2f}' == '0.02'
+                                if self._rank == 1:
+                                    assert f'{tmp:.2f}' == '0.04'
+                            if self._step == 2:
+                                if self._rank == 0:
+                                    assert f'{tmp:.3f}' == '0.056'
+                                if self._rank == 1:
+                                    assert f'{tmp:.3f}' == '0.092'
+
+                        tmp = self._V_blocks[i] + new_M - self._M_blocks[i]
+                        self._M_blocks[i].copy_(new_M)
+#                    X = tmp
+#                    logger.debug(f'{torch.isnan(X).any(), torch.isinf(X).any()}', rank=[0,1])
+                        self._V_blocks_comm[i].copy_(new_M)
+                        self._V_blocks[i].copy_(new_M)
+                        self._V_blocks_comm[i].mul_((1 - weight) / (len(edge.ranks) - 1))
+#                    X = self._V_blocks_comm[i]
+#                    logger.debug(f'{torch.isnan(X).any(), torch.isinf(X).any()}', rank=[0,1])
+
+                        self._comm_op_V[i] = dist.all_reduce(
+                            self._V_blocks_comm[i],
+                            op=dist.ReduceOp.SUM,
+                            group=edge.group,
+                            async_op=True
+                        )
+                    for i in range(len(self._param_buckets)):
+                        self._comm_op_V[i].wait()
+                        self._V_blocks[i].mul_(weight - (1 - weight) / (len(edge.ranks) - 1))
+                        self._V_blocks[i].add_(self._V_blocks_comm[i])
+
+#                    X =  self._V_blocks[i]
+#                    logger.debug(f'{torch.isnan(X).any(), torch.isinf(X).any()}')
+                        if self.toy_test:
+                            logger.debug(f'{self._V_blocks[i]}')
+                            logger.debug(f'{self._grad_blocks[i]}')
+                        self._grad_blocks[i].copy_(self._V_blocks[i])
+                        if self._step <=2 and i == 0:
+                            tmp1 = self._grad_blocks[i].is_contiguous()
+                            tmp2 = self._grad_blocks[i].is_contiguous(memory_format=torch.channels_last)
+                            logger.debug(f'{self._grad_blocks[i]}')
+                            logger.debug(f'{tmp1, tmp2}')
+                        for ind, ele in enumerate(self._param_buckets[i]):
+                            update = ele.grad
+                            if self._step <=2 and i == 0 and ind == 0:
+                                tmp1 = update.is_contiguous()
+                                tmp2 = update.is_contiguous(memory_format=torch.channels_last)
+                                logger.debug(f'{tmp1, tmp2}')
+#                            logger.debug(f'{update}')
+                            if self.toy_test:
+                                ele -= self.eta * update
+                            else:
+#                            if i < len(self._param_buckets_muon):
+                                if i < -1:
+                                    if update.ndim == 4: # for the case of conv filters
+                                        update = update.reshape(len(update), -1)
+                                    update = self.zeropower_via_newtonschulz5(update, 5)
+                                    update *= max(1,ele.grad.size(-2)/ele.grad.size(-1))**0.5
+                                    update = update.reshape(ele.shape)
+#                                    ele.mul_(1-lr*weigt_decay)
+#                                ele.add_(update, alpha=-self.eta / math.sqrt(self._step))
+                                ele.add_(update, alpha=-self.eta)
+                        self._param_blocks_comm[i].copy_(self._param_blocks[i])
+                        self._param_blocks_comm[i].mul_((1 - weight) / (len(edge.ranks) - 1))
+                        self._comm_op[i] = dist.all_reduce(
+                            self._param_blocks_comm[i],
+                            op=dist.ReduceOp.SUM,
+                            group=edge.group,
+                            async_op=True
+                        )
+
+                    self._lr_schedulers[0].step()
+                    start = time.time()
+                    for i in range(len(self._param_buckets)):
+                        self._comm_op[i].wait()
+                        self._param_blocks[i].mul_(weight - (1 - weight) / (len(edge.ranks) - 1))
+                        self._param_blocks[i].add_(self._param_blocks_comm[i])
+                if self._step <= 10:
+                    tmp = self._param_buckets[0][0]
+                    logger.debug(f'{tmp.shape,tmp[0,0,0,1], tmp.grad[0,0,0,1]}')
+
+                for i in range(len(self._param_buckets)):
+                    self._optims[i].zero_grad(set_to_none=False)
+
+                # here need to wait because it iterates over all buckets. And when executing self.V_comm_op[0].wait(), it will wait until self.V_comm_op[0] is finished. Note that all operations in self.V_comm_op are still running. The reason wait here is that the following lines require it to finish first.
         if self._model.training and (not self._is_grad_accum_enable):
             self._step += 1
 
@@ -491,6 +676,84 @@ class DecentralizedDataParallel(Module):
         """
         return super().named_parameters(prefix, recurse, remove_duplicate)
 
+    def create_block(self, inp_buckets):
+        _comm_blocks = list()
+        blocks_param = list()
+        for i in range(len(inp_buckets)):
+            total_size = sum([self._align(p.numel()) for p in inp_buckets[i]])
+
+            # make sure the total size is unique for each bucket \
+            # (not necessary, but make sure the communication operations are unique for each bucket with negligible overhead)
+
+            size_dict = {}
+            while total_size in size_dict:
+                total_size += 32
+            size_dict[total_size] = True
+
+            # create the communication buffer for each bucket
+            _comm_blocks.append(torch.zeros(total_size,
+                                        device=inp_buckets[i][0].device,
+                                        requires_grad=False,
+                                        dtype=inp_buckets[i][0].dtype))
+            if self._param_as_bucket_view: #true 
+                # create contiguous blocks for each bucket, and let the parameters be views of the fragments of the block
+                blocks_param.append(torch.zeros(total_size,
+                                                        device=inp_buckets[i][0].device,
+                                                        requires_grad=inp_buckets[i][0].requires_grad,
+                                                        dtype=inp_buckets[i][0].dtype))
+
+                start = 0
+                for j in range(len(inp_buckets[i])):
+                    size = inp_buckets[i][j].numel()
+                    if (len(inp_buckets[i][j].shape) == 4) and inp_buckets[i][j].is_contiguous(memory_format=torch.channels_last) \
+                        and (not inp_buckets[i][j].is_contiguous()):
+                        # permute the tensor to the channels_last format
+                        blocks_param[-1].narrow(0, start, size).copy_(inp_buckets[i][j].permute(0, 2, 3, 1).view(-1))
+                        tmp1 = blocks_param[-1].narrow(0, start, size).view(
+                            (inp_buckets[i][j].shape[0],
+                                inp_buckets[i][j].shape[2],
+                                inp_buckets[i][j].shape[3],
+                                inp_buckets[i][j].shape[1])
+                        )
+                        tmp2 = tmp1.permute(0, 3, 1, 2)
+                        inp_buckets[i][j].data = tmp2
+#                        logger.debug(f'{tmp1.is_contiguous(), tmp1.is_contiguous(memory_format=torch.channels_last), tmp2.is_contiguous(), tmp2.is_contiguous(memory_format=torch.channels_last)}')
+
+
+                        assert inp_buckets[i][j].is_contiguous(memory_format=torch.channels_last)
+                        assert not inp_buckets[i][j].is_contiguous()
+                    else:
+                        # otherwise, copy the tensor directly
+                        assert inp_buckets[i][j].is_contiguous()
+                        blocks_param[-1].narrow(0, start, size).copy_(inp_buckets[i][j].view(-1))
+                        inp_buckets[i][j].data = blocks_param[-1].narrow(0, start, size).view_as(inp_buckets[i][j])
+                        # same storage but different view
+                    start += self._align(size)
+
+            # start = 0
+            # self._comm_buffers.append([])
+            # for j in range(len(inp_buckets[i])):
+            #     size = inp_buckets[i][j].numel()
+            #     if (len(inp_buckets[i][j].shape) == 4) and inp_buckets[i][j].is_contiguous(memory_format=torch.channels_last) \
+            #         and (not inp_buckets[i][j].is_contiguous()):
+            #         # permute the tensor to the channels_last format
+            #         self._comm_buffers[-1].append(comm_block.narrow(0, start, size).view(
+            #             (inp_buckets[i][j].shape[0],
+            #              inp_buckets[i][j].shape[2],
+            #              inp_buckets[i][j].shape[3],
+            #              inp_buckets[i][j].shape[1])
+            #         ).permute(0, 3, 1, 2))
+            #     else:
+            #         self._comm_buffers[-1].append(comm_block.narrow(0, start, size).view_as(inp_buckets[i][j]))
+            #     start += self._align(size)
+
+            #     # attach the communication buffer to the parameter for "pre_average_hook" in the optimizer
+            #     if hasattr(self._optims[i], 'pre_average_hook'):
+            #         setattr(inp_buckets[i][j], 'comm_buffer', self._comm_buffers[-1][-1])
+            # initialize the communication buffer with the initial parameters
+            # torch._foreach_copy_(self._comm_buffers[-1], inp_buckets[i])
+
+        return _comm_blocks, blocks_param
 
     """Utility functions"""
 
