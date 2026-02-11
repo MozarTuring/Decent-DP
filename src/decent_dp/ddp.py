@@ -634,6 +634,7 @@ class DecentralizedDataParallel(Module):
                                     assert f"{tmp:.3f}" == "0.056"
                                 if self._rank == 1:
                                     assert f"{tmp:.3f}" == "0.092"
+                                    k
 
                         tmp = self._V_blocks[i] + new_M - self._M_blocks[i]
                         self._M_blocks[i].copy_(new_M)
@@ -686,8 +687,8 @@ class DecentralizedDataParallel(Module):
                                 ele -= self.eta * update
                             else:
                                 #                            if i < len(self._param_buckets_muon):
-                                if i < -1:
-                                    if update.ndim == 4:  # for the case of conv filters
+                                if i<len(self._param_buckets_muon):
+                                    if update.ndim >= 3:  # for the case of conv filters
                                         update = update.reshape(len(update), -1)
                                     update = self.zeropower_via_newtonschulz5(update, 5)
                                     update *= (
