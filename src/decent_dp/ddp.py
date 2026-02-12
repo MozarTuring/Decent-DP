@@ -698,7 +698,9 @@ class DecentralizedDataParallel(Module):
                                     update = update.reshape(ele.shape)
                                 #                                    ele.mul_(1-lr*weigt_decay)
                                 #                                ele.add_(update, alpha=-self.eta / math.sqrt(self._step))
-                                ele.add_(update, alpha=-self.eta)
+                                    ele.add_(update, alpha=-1.5e-3/math.sqrt(self._step))
+                                else:
+                                    ele.add_(update, alpha=-self.eta)
                         self._param_blocks_comm[i].copy_(self._param_blocks[i])
                         self._param_blocks_comm[i].mul_(
                             (1 - weight) / (len(edge.ranks) - 1)
